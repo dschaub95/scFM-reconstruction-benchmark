@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scgpt-benchmark"
+version = "0.1.0"
+description = "scGPT model runner for reconstruction benchmark"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "scgpt>=0.1.0",
+    # Install torch and torchtext together for compatibility
+    # Using versions that are known to work together
+    "torch==2.1.0",
+    "torchtext==0.16.0",  # Compatible with torch 2.1.0
+    "numpy>=1.24.0,<2.0.0",  # Constrain to NumPy 1.x for torch 2.1.0 compatibility
+    "anndata>=0.10.0",
+    "scanpy>=1.9.0",
+    "pandas>=1.5.0",
+    "ipython>=8.0.0",  # Required by scGPT
+    "gdown>=4.7.0",  # For downloading checkpoints from Google Drive
+]
+# Note: reconstruction-benchmark is installed separately via uv pip install
+
+[project.scripts]
+scgpt-run = "main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+include = ["main.py"]
+

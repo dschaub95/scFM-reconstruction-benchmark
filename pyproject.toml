@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reconstruction-benchmark"
+version = "0.1.0"
+description = "Reconstruction benchmark for single-cell foundation models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anndata>=0.10.0",
+    "scanpy>=1.9.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "pandas>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+prepare-data = "reconstruction_benchmark.cli.prepare_data:main"
+run-evaluation = "reconstruction_benchmark.cli.run_evaluation:main"
+run-models = "reconstruction_benchmark.cli.run_models:main"
+run-benchmark = "reconstruction_benchmark.cli.run_benchmark:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reconstruction_benchmark"]
