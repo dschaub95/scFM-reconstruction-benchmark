@@ -18,6 +18,7 @@ try:
     # Import scGPT - use the actual API structure
     from scgpt.model.model import TransformerModel as scGPT
     from scgpt.tokenizer.gene_tokenizer import GeneVocab
+    from scgpt.utils import load_pretrained
 
     # scGPTConfig might not exist as a separate class - TransformerModel uses dict/config
     # We'll handle config creation inline
@@ -132,7 +133,8 @@ def download_checkpoint_from_gdrive(
                                 print(f"Moved {file} from {subdir} to {output_dir}")
 
         if not quiet:
-            print(f"Successfully downloaded checkpoint to: {output_dir}")
+            print(f"✓ Successfully downloaded checkpoint to: {output_dir}")
+            sys.stdout.flush()
         return True
 
     except Exception as e:
@@ -169,11 +171,12 @@ def download_scgpt_checkpoint_from_gdrive(
     # Check if checkpoint already exists
     if checkpoint_path.exists() and (checkpoint_path / "best_model.pt").exists():
         if not force_download:
-            print(f"Checkpoint already exists at: {checkpoint_path}")
+            print(f"✓ Checkpoint already exists at: {checkpoint_path}")
             print("Skipping download. Use force_download=True to re-download.")
+            sys.stdout.flush()
             return checkpoint_path
         else:
-            print(f"Force download enabled. Re-downloading checkpoint...")
+            print("Force download enabled. Re-downloading checkpoint...")
 
     # Download from Google Drive
     success = download_checkpoint_from_gdrive(
@@ -230,6 +233,49 @@ def load_masked_data(config: ModelConfig) -> ad.AnnData:
     return adata
 
 
+def convert_checkpoint_weights(state_dict: dict) -> dict:
+    """
+    Convert checkpoint weights from fast_transformer format (Wqkv) to standard format (in_proj).
+
+    This function handles the case where the checkpoint was trained with flash attention
+    (using Wqkv combined QKV weights) but the model is running without flash-attn installed
+    (expecting separate in_proj_weight/in_proj_bias).
+
+    Parameters
+    ----------
+    state_dict
+        Original checkpoint state dict with Wqkv keys
+
+    Returns
+    -------
+    Converted state dict with in_proj keys
+    """
+    converted_dict = {}
+    keys_to_skip = set()  # Track keys we've converted
+
+    for key, value in state_dict.items():
+        # Skip flag_encoder.weight (not used in standard model)
+        if key == "flag_encoder.weight":
+            continue
+
+        # Convert Wqkv format to in_proj format
+        if ".self_attn.Wqkv.weight" in key:
+            # Replace Wqkv.weight with in_proj_weight
+            new_key = key.replace(".self_attn.Wqkv.weight", ".self_attn.in_proj_weight")
+            converted_dict[new_key] = value
+            keys_to_skip.add(key)
+        elif ".self_attn.Wqkv.bias" in key:
+            # Replace Wqkv.bias with in_proj_bias
+            new_key = key.replace(".self_attn.Wqkv.bias", ".self_attn.in_proj_bias")
+            converted_dict[new_key] = value
+            keys_to_skip.add(key)
+        elif key not in keys_to_skip:
+            # Keep all other keys as-is
+            converted_dict[key] = value
+
+    return converted_dict
+
+
 def prepare_data_for_scgpt(adata: ad.AnnData) -> tuple:
     """
     Prepare AnnData for scGPT model input.
@@ -260,7 +306,6 @@ def prepare_data_for_scgpt(adata: ad.AnnData) -> tuple:
 
 def run_scgpt_reconstruction(
     adata: ad.AnnData,
-    model_name: str = "bwanglab/scGPT",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     dev_mode: bool = False,
 ) -> ad.AnnData:
@@ -271,8 +316,6 @@ def run_scgpt_reconstruction(
     ----------
     adata
         AnnData object with masked data
-    model_name
-        Name of the scGPT model checkpoint to use
     device
         Device to run inference on
 
@@ -286,7 +329,6 @@ def run_scgpt_reconstruction(
         )
 
     # Validate and potentially fix device
-    original_device = device
     if device == "cuda":
         # Test if CUDA actually works
         try:
@@ -337,141 +379,310 @@ def run_scgpt_reconstruction(
     else:
         batch_size = n_cells  # Process all at once for smaller datasets
 
-    # Create gene vocabulary with special tokens
-    try:
-        # GeneVocab needs special tokens - add them to gene list
-        special_tokens = [
-            "<pad>",
-            "<mask>",
-            "<cls>",
-            "<eoc>",
-        ]  # Common scGPT special tokens
-        all_tokens = special_tokens + gene_names
-        gene_vocab = GeneVocab(all_tokens)
-        # Set default index for unknown tokens
-        if hasattr(gene_vocab, "set_default_index"):
-            pad_idx = gene_vocab["<pad>"]
-            gene_vocab.set_default_index(pad_idx)
-        vocab_size = len(gene_vocab)
-    except Exception as e:
-        print(f"Warning: Could not create gene vocabulary: {e}")
-        # Fallback: create vocab with special tokens manually
-        special_tokens = ["<pad>", "<mask>", "<cls>", "<eoc>"]
-        all_tokens = special_tokens + gene_names
-        gene_vocab = GeneVocab(all_tokens)
-        vocab_size = len(gene_vocab)
+    # Track checkpoint file and directory for loading vocab and weights
+    # We need to detect checkpoint early to load vocab.json before creating model
+    checkpoint_file = None
+    checkpoint_dir = None
+
+    # Always look for checkpoints in the checkpoints folder
+    checkpoints_dir = get_checkpoints_dir()
+
+    # Search for any checkpoint in the checkpoints directory
+    if checkpoints_dir.exists():
+        # Look for any subdirectory containing best_model.pt
+        for checkpoint_subdir in checkpoints_dir.iterdir():
+            if checkpoint_subdir.is_dir():
+                potential_checkpoint = checkpoint_subdir / "best_model.pt"
+                if potential_checkpoint.exists():
+                    checkpoint_file = potential_checkpoint
+                    checkpoint_dir = checkpoint_subdir
+                    break
+
+    # If no checkpoint found, try auto-downloading from Google Drive
+    if checkpoint_file is None or not checkpoint_file.exists():
+        try:
+            print(
+                "No local checkpoint found. Automatically downloading from Google Drive..."
+            )
+            sys.stdout.flush()
+            gdrive_folder_id = "1oWh_-ZRdhtoGQ2Fw24HP41FgLoomVo-y"
+            checkpoint_name = "scGPT-human"
+
+            local_checkpoint_path = download_scgpt_checkpoint_from_gdrive(
+                checkpoint_name=checkpoint_name,
+                gdrive_folder_id=gdrive_folder_id,
+                force_download=False,
+            )
+
+            checkpoint_file = local_checkpoint_path / "best_model.pt"
+            checkpoint_dir = local_checkpoint_path
+
+            if checkpoint_file.exists():
+                print(f"✓ Successfully downloaded checkpoint to: {checkpoint_file}")
+                sys.stdout.flush()
+        except Exception as e:
+            print(f"✗ Failed to download checkpoint from Google Drive: {e}")
+            print("Will initialize new model (no pretrained weights)")
+            sys.stdout.flush()
+            checkpoint_file = None
+            checkpoint_dir = None
+
+    # Load vocabulary from checkpoint vocab.json if available, otherwise create from gene names
+    gene_vocab = None
+    vocab_size = None
+
+    if checkpoint_dir and (checkpoint_dir / "vocab.json").exists():
+        vocab_json_path = checkpoint_dir / "vocab.json"
+        try:
+            print(f"Loading vocabulary from checkpoint: {vocab_json_path}")
+            sys.stdout.flush()
+
+            # Load vocab.json - it's typically a list of tokens or a dict mapping tokens to indices
+            with open(vocab_json_path) as f:
+                vocab_data = json.load(f)
+
+            # Handle different vocab.json formats
+            if isinstance(vocab_data, list):
+                # If it's a list, use it directly
+                vocab_tokens = vocab_data
+            elif isinstance(vocab_data, dict):
+                # If it's a dict, extract the keys (tokens)
+                # Sort by index to maintain order (though GeneVocab may reorder)
+                vocab_tokens = sorted(vocab_data.keys(), key=lambda k: vocab_data[k])
+            else:
+                raise ValueError(f"Unexpected vocab.json format: {type(vocab_data)}")
+
+            # Create GeneVocab from checkpoint vocabulary
+            gene_vocab = GeneVocab(vocab_tokens)
+            if hasattr(gene_vocab, "set_default_index"):
+                # Use dictionary-style access instead of .get() method
+                if "<pad>" in gene_vocab:
+                    pad_idx = gene_vocab["<pad>"]
+                else:
+                    # Fallback: find pad token index from vocab_data dict if available
+                    if isinstance(vocab_data, dict) and "<pad>" in vocab_data:
+                        pad_idx = vocab_data["<pad>"]
+                    else:
+                        pad_idx = 0
+                gene_vocab.set_default_index(pad_idx)
+            vocab_size = len(gene_vocab)
+            print(f"✓ Loaded vocabulary with {vocab_size} tokens from checkpoint")
+            sys.stdout.flush()
+        except Exception as e:
+            # If checkpoint exists but vocab loading fails, this is a critical error
+            if checkpoint_file and checkpoint_file.exists():
+                raise RuntimeError(
+                    f"Failed to load checkpoint vocabulary from {vocab_json_path}. "
+                    f"This is required to load the checkpoint weights. Error: {e}"
+                )
+            else:
+                # No checkpoint file, so vocab loading failure is not critical
+                print(f"Warning: Could not load checkpoint vocabulary: {e}")
+                print("Creating vocabulary from data gene names...")
+                sys.stdout.flush()
+                gene_vocab = None
+
+    # Create vocabulary from gene names if checkpoint vocab not available
+    if gene_vocab is None:
+        try:
+            # GeneVocab needs special tokens - add them to gene list
+            special_tokens = [
+                "<pad>",
+                "<mask>",
+                "<cls>",
+                "<eoc>",
+            ]  # Common scGPT special tokens
+            all_tokens = special_tokens + gene_names
+            gene_vocab = GeneVocab(all_tokens)
+            # Set default index for unknown tokens
+            if hasattr(gene_vocab, "set_default_index"):
+                pad_idx = gene_vocab["<pad>"]
+                gene_vocab.set_default_index(pad_idx)
+            vocab_size = len(gene_vocab)
+            print(f"Created vocabulary with {vocab_size} tokens from data")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"Warning: Could not create gene vocabulary: {e}")
+            # Fallback: create vocab with special tokens manually
+            special_tokens = ["<pad>", "<mask>", "<cls>", "<eoc>"]
+            all_tokens = special_tokens + gene_names
+            gene_vocab = GeneVocab(all_tokens)
+            vocab_size = len(gene_vocab)
 
     # Initialize model with appropriate parameters
     # Using default parameters that work for reconstruction
     model = None
+
     try:
-        # Try to load pretrained model if model_name is provided
-        if model_name and hasattr(scGPT, "from_pretrained"):
-            # Check if we have a local checkpoint first
-            local_checkpoint_path = get_local_checkpoint_path(model_name)
+        # Try to load pretrained checkpoint if found
+        if checkpoint_file and checkpoint_file.exists():
+            print(f"\n{'=' * 60}")
+            checkpoint_name = checkpoint_dir.name if checkpoint_dir else "checkpoint"
+            print(f"Loading scGPT checkpoint: {checkpoint_name}")
+            print(f"{'=' * 60}")
+            print(f"Checkpoint directory: {checkpoint_dir}")
+            print(f"✓ Found checkpoint at: {checkpoint_file}")
+            print("Will load checkpoint weights after model initialization...")
+            sys.stdout.flush()
 
-            # Special handling for Google Drive checkpoint
-            # If model_name is "gdrive" or starts with "gdrive:", download from Google Drive
-            if model_name == "gdrive" or model_name.startswith("gdrive:"):
-                gdrive_folder_id = (
-                    "1oWh_-ZRdhtoGQ2Fw24HP41FgLoomVo-y"  # Default scGPT checkpoint
-                )
-                if ":" in model_name:
-                    # Allow custom folder ID: "gdrive:FOLDER_ID"
-                    gdrive_folder_id = model_name.split(":", 1)[1]
+        # Initialize model with appropriate parameters for gene expression
+        # Try to load architecture from checkpoint args.json if available
+        model_config = {
+            "d_model": 512,  # Model dimension (embsize)
+            "nhead": 8,  # Number of attention heads
+            "d_hid": 2048,  # Feedforward dimension (default, will override from checkpoint)
+            "nlayers": 6,  # Number of transformer layers (default, will override from checkpoint)
+            "nlayers_cls": 3,  # Classification layers
+            "dropout": 0.1,  # Dropout (default, will override from checkpoint)
+            "pad_value": 0,  # Pad value (default, will override from checkpoint)
+            "do_mvc": False,  # Not using MVC decoder (default, will override from checkpoint)
+            "use_fast_transformer": False,  # Fast transformer (flash attention) - will override from checkpoint
+        }
 
-                checkpoint_name = (
-                    "scGPT-human"  # Default name for Google Drive checkpoint
-                )
-                print(
-                    f"Downloading checkpoint from Google Drive (folder: {gdrive_folder_id})..."
-                )
+        # Load checkpoint args.json if available to get correct architecture
+        if checkpoint_file and checkpoint_file.exists():
+            args_json_path = checkpoint_file.parent / "args.json"
+            if args_json_path.exists():
                 try:
-                    local_checkpoint_path = download_scgpt_checkpoint_from_gdrive(
-                        checkpoint_name=checkpoint_name,
-                        gdrive_folder_id=gdrive_folder_id,
-                        force_download=False,
-                    )
-                    model_name = str(
-                        local_checkpoint_path
-                    )  # Use local path for loading
-                except Exception as e:
-                    print(f"Failed to download from Google Drive: {e}")
-                    print("Falling back to HuggingFace or new model initialization...")
+                    with open(args_json_path) as f:
+                        checkpoint_args = json.load(f)
+                    print("Loading model architecture from checkpoint args.json...")
+                    sys.stdout.flush()
 
-            # Try local checkpoint first if it exists
-            if (
-                local_checkpoint_path.exists()
-                and (local_checkpoint_path / "best_model.pt").exists()
-            ):
-                try:
+                    # Override with checkpoint architecture parameters
+                    model_config["d_model"] = checkpoint_args.get(
+                        "embsize", model_config["d_model"]
+                    )
+                    model_config["nhead"] = checkpoint_args.get(
+                        "nheads", model_config["nhead"]
+                    )
+                    model_config["d_hid"] = checkpoint_args.get(
+                        "d_hid", model_config["d_hid"]
+                    )
+                    model_config["nlayers"] = checkpoint_args.get(
+                        "nlayers", model_config["nlayers"]
+                    )
+                    model_config["nlayers_cls"] = checkpoint_args.get(
+                        "n_layers_cls", model_config["nlayers_cls"]
+                    )
+                    model_config["dropout"] = checkpoint_args.get(
+                        "dropout", model_config["dropout"]
+                    )
+                    model_config["pad_value"] = checkpoint_args.get(
+                        "pad_value", model_config["pad_value"]
+                    )
+                    model_config["do_mvc"] = checkpoint_args.get(
+                        "MVC", model_config["do_mvc"]
+                    )
+                    # fast_transformer in checkpoint args.json maps to use_fast_transformer parameter
+                    model_config["use_fast_transformer"] = checkpoint_args.get(
+                        "fast_transformer", model_config["use_fast_transformer"]
+                    )
+
                     print(
-                        f"Loading checkpoint from local directory: {local_checkpoint_path}"
+                        f"  Architecture: d_model={model_config['d_model']}, d_hid={model_config['d_hid']}, "
+                        f"nlayers={model_config['nlayers']}, nhead={model_config['nhead']}, "
+                        f"use_fast_transformer={model_config['use_fast_transformer']}"
                     )
-                    # Try loading from local directory
-                    # scGPT's from_pretrained might accept a local path
-                    model = scGPT.from_pretrained(str(local_checkpoint_path))
-                    print(
-                        f"Loaded pretrained model from local checkpoint: {local_checkpoint_path}"
-                    )
+                    sys.stdout.flush()
                 except Exception as e:
-                    print(f"Could not load from local checkpoint: {e}")
-                    print("Trying HuggingFace download instead...")
-                    # Fall through to HuggingFace download
-
-            # If local checkpoint doesn't exist or failed, try HuggingFace
-            if model is None:
-                try:
-                    print(
-                        f"Downloading/loading pretrained model from HuggingFace: {model_name}"
-                    )
-                    model = scGPT.from_pretrained(model_name)
-                    print(f"Loaded pretrained model: {model_name}")
-
-                    # Save checkpoint locally for future use
-                    try:
-                        local_checkpoint_path.mkdir(parents=True, exist_ok=True)
-                        # If the model has a save_pretrained method, use it
-                        if hasattr(model, "save_pretrained"):
-                            model.save_pretrained(str(local_checkpoint_path))
-                            print(f"Saved checkpoint to: {local_checkpoint_path}")
-                        else:
-                            # Try to save the model state dict manually
-                            if hasattr(model, "state_dict"):
-                                checkpoint_file = (
-                                    local_checkpoint_path / "best_model.pt"
-                                )
-                                torch.save(model.state_dict(), checkpoint_file)
-                                print(f"Saved model state dict to: {checkpoint_file}")
-                    except Exception as save_error:
-                        print(
-                            f"Warning: Could not save checkpoint locally: {save_error}"
-                        )
-                        print("Model loaded but not cached locally")
-
-                except Exception as e:
-                    print(f"Could not load pretrained model {model_name}: {e}")
-                    print("Initializing new model instead")
+                    print(f"Warning: Could not load args.json: {e}")
+                    print("Using default architecture parameters...")
+                    sys.stdout.flush()
 
         if model is None:
-            # Initialize new model with appropriate parameters for gene expression
-            # Default parameters based on scGPT typical configuration
+            print("Initializing scGPT model architecture...")
+            sys.stdout.flush()
+
+            # Ensure vocab_size is set - use checkpoint vocab if available, otherwise data vocab
+            if vocab_size is None:
+                raise RuntimeError(
+                    "Vocabulary size not determined. Cannot initialize model."
+                )
+
+            print(f"  Using vocabulary size: {vocab_size} tokens")
+            sys.stdout.flush()
+
             model = scGPT(
-                ntoken=vocab_size,
-                d_model=512,  # Model dimension
-                nhead=8,  # Number of attention heads
-                d_hid=2048,  # Feedforward dimension
-                nlayers=6,  # Number of transformer layers
-                nlayers_cls=3,  # Classification layers
+                ntoken=vocab_size,  # Use vocab size from checkpoint or data
+                d_model=model_config["d_model"],
+                nhead=model_config["nhead"],
+                d_hid=model_config["d_hid"],
+                nlayers=model_config["nlayers"],
+                nlayers_cls=model_config["nlayers_cls"],
                 vocab=gene_vocab,
-                dropout=0.1,
+                dropout=model_config["dropout"],
                 pad_token="<pad>",
-                pad_value=0,
-                do_mvc=False,  # Not using MVC decoder
+                pad_value=model_config["pad_value"],
+                do_mvc=model_config["do_mvc"],
                 input_emb_style="continuous",  # Continuous value encoding
                 cell_emb_style="cls",  # CLS token for cell embedding
+                use_fast_transformer=model_config[
+                    "use_fast_transformer"
+                ],  # Match checkpoint architecture
             )
-            print("Initialized new scGPT model")
+
+            # Try to load checkpoint weights if available
+            if checkpoint_file and checkpoint_file.exists():
+                try:
+                    print(f"Loading pretrained weights from: {checkpoint_file}")
+                    sys.stdout.flush()
+                    checkpoint = torch.load(checkpoint_file, map_location="cpu")
+
+                    # Extract state dict from checkpoint
+                    if isinstance(checkpoint, dict):
+                        if "model_state_dict" in checkpoint:
+                            state_dict = checkpoint["model_state_dict"]
+                        elif "state_dict" in checkpoint:
+                            state_dict = checkpoint["state_dict"]
+                        else:
+                            state_dict = checkpoint
+                    else:
+                        state_dict = checkpoint
+
+                    # Convert weights if checkpoint uses Wqkv format (flash attention) but model expects in_proj format
+                    # This is only needed when checkpoint was trained with flash-attn but model runs without it
+                    # If model architecture matches checkpoint (both use flash attention), no conversion needed
+                    has_wqkv = any(
+                        ".self_attn.Wqkv." in key for key in state_dict.keys()
+                    )
+                    model_expects_in_proj = not model_config["use_fast_transformer"]
+
+                    if has_wqkv and model_expects_in_proj:
+                        print(
+                            "  Converting checkpoint weights from Wqkv format to in_proj format..."
+                        )
+                        print(
+                            "  (Checkpoint uses flash attention format, but model runs without it - converting)"
+                        )
+                        sys.stdout.flush()
+                        state_dict = convert_checkpoint_weights(state_dict)
+                    elif has_wqkv and not model_expects_in_proj:
+                        print(
+                            "  Checkpoint uses flash attention format, model architecture matches - no conversion needed"
+                        )
+                        sys.stdout.flush()
+
+                    # Use scGPT's internal load_pretrained function for better weight loading
+                    # This handles mismatches more gracefully than manual load_state_dict
+                    print("  Loading weights using scGPT's load_pretrained function...")
+                    sys.stdout.flush()
+                    model = load_pretrained(
+                        model=model,
+                        pretrained_params=state_dict,
+                        strict=False,  # Allow partial loading for architecture differences
+                        verbose=True,  # Print loading information
+                    )
+                    print("✓ Successfully loaded pretrained weights from checkpoint")
+                    print(f"  Checkpoint: {checkpoint_file}")
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(f"✗ Could not load checkpoint weights: {e}")
+                    print("Continuing with randomly initialized weights...")
+                    sys.stdout.flush()
+            else:
+                print("✓ Initialized new scGPT model (no pretrained checkpoint)")
+                sys.stdout.flush()
     except Exception as e:
         print(f"Error initializing model: {e}")
         raise RuntimeError(f"Failed to initialize scGPT model: {e}")
@@ -691,12 +902,6 @@ def main():
         help="Random seed used for masking (default: 42)",
     )
     parser.add_argument(
-        "--model-name",
-        type=str,
-        default="bwanglab/scGPT",
-        help="scGPT model checkpoint name. Options: 'bwanglab/scGPT' (HuggingFace, default), 'gdrive' (download from Google Drive), 'gdrive:FOLDER_ID' (custom Google Drive folder), or local path. Checkpoints are saved in models/scgpt/checkpoints/",
-    )
-    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -736,7 +941,6 @@ def main():
     print("Running scGPT reconstruction...")
     reconstruction = run_scgpt_reconstruction(
         masked_data,
-        model_name=args.model_name,
         device=device,
         dev_mode=args.dev,
     )

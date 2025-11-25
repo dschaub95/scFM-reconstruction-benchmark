@@ -15,7 +15,9 @@ reconstruction-benchmark/
 │       ├── data_prep.py              # Data preparation utilities
 │       └── cli/
 │           ├── prepare_data.py       # prepare-data CLI
-│           └── run_evaluation.py     # run-evaluation CLI
+│           ├── run_evaluation.py     # run-evaluation CLI
+│           ├── run_models.py         # run-models CLI
+│           └── run_benchmark.py      # run-benchmark CLI (complete pipeline)
 ├── models/
 │   └── scgpt/                        # scGPT model implementation
 │       ├── pyproject.toml            # Model-specific dependencies
@@ -46,54 +48,38 @@ pip install -e .
 
 ## Usage
 
-### 1. Prepare Data
+### Complete Pipeline (Recommended)
 
-Download and mask a dataset:
+Run the complete pipeline (prepare data → run models → evaluate):
+
+```bash
+run-benchmark --dataset pbmc
+```
+
+This automatically:
+1. Prepares dataset with masking
+2. Discovers and runs all models in `models/`
+3. Evaluates all reconstructions
+
+### Individual Steps
+
+**1. Prepare Data**
 
 ```bash
 prepare-data --dataset pbmc --mask-percentage 0.15 --seed 42
 ```
 
-This will:
-- Download the PBMC dataset from Scanpy (if not already downloaded)
-- Mask 15% of values (replaced with -1)
-- Save raw data to `data/pbmc/raw/data.h5ad`
-- Save masked data to `data/pbmc/masked/mask_15_seed_42.h5ad`
-
-### 2. Run Model
-
-Run a model on the prepared data. For scGPT:
+**2. Run All Models**
 
 ```bash
-cd models/scgpt
-uv run scgpt-run --dataset pbmc
+run-models --dataset pbmc
 ```
 
-Or with conda:
-
-```bash
-cd models/scgpt
-conda run -n scgpt-env python main.py --dataset pbmc
-```
-
-This will:
-- Load masked data from `data/pbmc/masked/mask_15_seed_42.h5ad`
-- Convert -1 values to model-specific mask tokens
-- Run reconstruction
-- Save results to `results/pbmc/mask_15_seed_42/scgpt/`
-
-### 3. Evaluate Results
-
-Run evaluation metrics:
+**3. Evaluate Results**
 
 ```bash
 run-evaluation --model scgpt --dataset pbmc
 ```
-
-This will:
-- Load ground truth and reconstruction
-- Compute metrics (MSE, MAE, Pearson correlation)
-- Save results to `results/pbmc/mask_15_seed_42/scgpt/metrics.json`
 
 ## Adding New Models
 

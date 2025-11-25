@@ -277,7 +277,8 @@ def run_model(
         # This avoids needing to install the model as a package
         print(f"Running {model_name}...")
         # Always run main.py directly since we're not installing the model package
-        run_cmd = [str(venv_python), str(model_dir / "main.py")]
+        # Use -u flag for unbuffered output to ensure checkpoint loading messages are visible
+        run_cmd = [str(venv_python), "-u", str(model_dir / "main.py")]
     else:
         # Use pip to install and run
         print(f"Installing {model_name}...")
@@ -310,7 +311,8 @@ def run_model(
             run_cmd = [script_name]
         else:
             # Fallback to running main.py directly
-            run_cmd = [sys.executable, str(model_dir / "main.py")]
+            # Use -u flag for unbuffered output to ensure checkpoint loading messages are visible
+            run_cmd = [sys.executable, "-u", str(model_dir / "main.py")]
 
     # Add common arguments
     run_cmd.extend(
