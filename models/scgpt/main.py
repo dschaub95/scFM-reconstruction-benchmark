@@ -1,7 +1,6 @@
 """Main entry point for scGPT reconstruction benchmark."""
 
 import argparse
-import sys
 from pathlib import Path
 
 import torch

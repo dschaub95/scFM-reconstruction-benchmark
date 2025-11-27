@@ -82,6 +82,37 @@ def discover_models(models_dir: Path) -> List[str]:
     return sorted(models)
 
 
+def discover_datasets(data_dir: Path) -> List[str]:
+    """
+    Discover all datasets in the data directory.
+
+    A dataset is identified by having a masked subdirectory with .h5ad files.
+
+    Parameters
+    ----------
+    data_dir
+        Path to the data directory
+
+    Returns
+    -------
+    List of dataset names (directory names)
+    """
+    datasets = []
+    if not data_dir.exists():
+        return datasets
+
+    for dataset_dir in data_dir.iterdir():
+        if not dataset_dir.is_dir():
+            continue
+
+        # Check if it has a masked subdirectory with .h5ad files
+        masked_dir = dataset_dir / "masked"
+        if masked_dir.exists() and any(masked_dir.glob("*.h5ad")):
+            datasets.append(dataset_dir.name)
+
+    return sorted(datasets)
+
+
 def run_model(
     model_name: str,
     model_dir: Path,
@@ -233,6 +264,18 @@ def main():
         default=None,
         help="Specific file to run (e.g., 'install', 'install.py', 'download_ckpt.py'). Defaults to main.py. All other arguments will be passed to the model's main.py.",
     )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Directory containing data (default: data relative to project root)",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Specific dataset to run (default: all discovered datasets)",
+    )
 
     # Use parse_known_args to allow pass-through of arguments to the file being run
     # This allows extra arguments to be passed to main.py when a single model is specified
@@ -243,6 +286,24 @@ def main():
 
     # Set default paths relative to project root
     models_dir = (project_root / (args.models_dir or Path("models"))).resolve()
+    data_dir = (project_root / (args.data_dir or Path("data"))).resolve()
+
+    # Discover datasets
+    all_datasets = discover_datasets(data_dir)
+
+    # Handle dataset filtering
+    if args.dataset:
+        if args.dataset not in all_datasets:
+            print(f"Dataset '{args.dataset}' not found", file=sys.stderr)
+            print(f"Available datasets: {all_datasets}", file=sys.stderr)
+            sys.exit(1)
+        datasets_to_run = [args.dataset]
+    else:
+        if not all_datasets:
+            print(f"No datasets found in {data_dir}", file=sys.stderr)
+            print("Please prepare datasets first using 'prepare-data'", file=sys.stderr)
+            sys.exit(1)
+        datasets_to_run = all_datasets
 
     # Discover models
     all_models = discover_models(models_dir)
@@ -270,43 +331,44 @@ def main():
     else:
         models_to_run = all_models
 
-    # Validate that pass-through arguments are only used with a single model
-    if unknown_args and len(models_to_run) > 1:
-        print(
-            "Error: Cannot pass arguments to file when running multiple models.",
-            file=sys.stderr,
-        )
-        print(
-            "Please specify a single model with -m/--model to pass additional arguments.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # If unknown arguments are provided but no single model is specified, treat as error
-    if unknown_args and len(models_to_run) != 1:
-        parser.error(f"unrecognized arguments: {' '.join(unknown_args)}")
+    # Pass-through arguments are supported for any number of models and datasets
 
     print(f"Found {len(all_models)} model(s): {', '.join(all_models)}")
     print(f"Will run {len(models_to_run)} model(s): {', '.join(models_to_run)}")
+    print(f"Found {len(all_datasets)} dataset(s): {', '.join(all_datasets)}")
+    print(
+        f"Will run for {len(datasets_to_run)} dataset(s): {', '.join(datasets_to_run)}"
+    )
     if args.file:
         print(f"Will run file: {args.file}")
-    if unknown_args and len(models_to_run) == 1:
+    if unknown_args:
         file_name = args.file or "main.py"
         print(f"Passing arguments to {file_name}: {' '.join(unknown_args)}")
 
-    # Run each model
+    # Run each model for each dataset
     results = {}
-    for model_name in models_to_run:
-        model_dir = models_dir / model_name
-        # Pass all unknown args to model's main.py (only if single model)
-        extra_args_to_pass = unknown_args if len(models_to_run) == 1 else None
-        success = run_model(
-            model_name=model_name,
-            model_dir=model_dir,
-            file_name=args.file,
-            extra_args=extra_args_to_pass,
-        )
-        results[model_name] = success
+    for dataset_name in datasets_to_run:
+        print(f"\n{'=' * 60}")
+        print(f"Processing dataset: {dataset_name}")
+        print(f"{'=' * 60}")
+        for model_name in models_to_run:
+            model_dir = models_dir / model_name
+            # Build extra args: start with unknown_args if provided, otherwise empty
+            extra_args_list = list(unknown_args) if unknown_args else []
+
+            # Always add dataset and data-dir arguments
+            # Note: These are known arguments to this parser, so they can never appear in unknown_args
+            extra_args_list.extend(["--dataset", dataset_name])
+            extra_args_list.extend(["--data-dir", str(data_dir)])
+
+            result_key = f"{model_name}@{dataset_name}"
+            success = run_model(
+                model_name=f"{model_name} (dataset: {dataset_name})",
+                model_dir=model_dir,
+                file_name=args.file,
+                extra_args=extra_args_list,
+            )
+            results[result_key] = success
 
     # Print summary
     print(f"\n{'=' * 60}")

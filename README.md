@@ -30,9 +30,9 @@ reconstruction-benchmark/
 │           ├── mask_<pct>_seed_<seed>.h5ad  # Multiple masked files
 │           └── ...
 └── results/                          # Model results (generated)
-    └── <dataset>/
-        └── mask_<pct>_seed_<seed>/   # Experimental condition
-            └── <model>/
+    └── <model>/
+        └── <dataset>/
+            └── mask_<pct>_seed_<seed>/   # Experimental condition
                 ├── reconstruction.h5ad
                 ├── metadata.json
                 └── metrics.json
@@ -89,7 +89,7 @@ run-evaluation --model scgpt --dataset pbmc
    - Loads masked data from `data/<dataset>/masked/mask_<pct>_seed_<seed>.h5ad`
    - Converts -1 to model-specific mask tokens
    - Runs reconstruction
-   - Saves to `results/<dataset>/mask_<pct>_seed_<seed>/<model>/reconstruction.h5ad`
+   - Saves to `results/<model>/<dataset>/mask_<pct>_seed_<seed>/reconstruction.h5ad`
 
 ## Adding New Metrics
 
@@ -106,10 +106,10 @@ Metrics are registered in `src/reconstruction_benchmark/metrics.py`. To add a ne
   - Masked data: `data/<dataset>/masked/mask_<pct>_seed_<seed>.h5ad` (one file per experimental condition)
   - Each dataset has `raw/` and `masked/` subfolders
   - Multiple masked files can exist in the `masked/` folder for different mask percentages and seeds
-- **Results**: `results/<dataset>/mask_<pct>_seed_<seed>/<model>/`
+- **Results**: `results/<model>/<dataset>/mask_<pct>_seed_<seed>/`
   - All outputs (reconstruction.h5ad, metadata.json, metrics.json) are stored together
-  - Experimental conditions (mask percentage + seed) are grouped together
-  - Makes it easy to compare models on the same experimental setup
+  - Results are organized by model first, then dataset, then experimental condition (mask percentage + seed)
+  - Makes it easy to find all results for a specific model
 - Masked values are stored as `-1` in the data files
 - Models convert `-1` to their specific mask tokens during inference
 

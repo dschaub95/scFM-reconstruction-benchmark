@@ -15,8 +15,8 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="pbmc",
-        help="Dataset name (default: pbmc)",
+        default=None,
+        help="Dataset name. If not specified, all available datasets will be prepared.",
     )
     parser.add_argument(
         "--mask-percentage",

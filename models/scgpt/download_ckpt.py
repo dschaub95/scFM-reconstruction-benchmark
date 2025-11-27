@@ -1,6 +1,5 @@
 """Download checkpoint for scGPT model."""
 
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional

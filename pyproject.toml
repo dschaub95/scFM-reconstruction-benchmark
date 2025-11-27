@@ -22,7 +22,7 @@ dev = [
 ]
 
 [project.scripts]
-prepare-data = "reconstruction_benchmark.cli.prepare_data:main"
+run-data-prep = "reconstruction_benchmark.cli.prepare_data:main"
 run-evaluation = "reconstruction_benchmark.cli.run_evaluation:main"
 run-models = "reconstruction_benchmark.cli.run_models:main"
 run-benchmark = "reconstruction_benchmark.cli.run_benchmark:main"

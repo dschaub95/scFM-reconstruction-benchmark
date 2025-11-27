@@ -22,9 +22,6 @@ dependencies = [
 ]
 # Note: reconstruction-benchmark is installed separately via uv pip install
 
-[project.scripts]
-scgpt-run = "main:main"
-
 [tool.hatch.build.targets.wheel]
 packages = ["."]
 include = ["main.py", "install.py", "download_ckpt.py", "setup.py", "inference.py"]
