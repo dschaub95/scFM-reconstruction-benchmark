@@ -53,7 +53,7 @@ pip install -e .
 Run the complete pipeline (prepare data → run models → evaluate):
 
 ```bash
-run-benchmark --dataset pbmc
+run-benchmark --dataset pbmc3k
 ```
 
 This automatically:
@@ -66,19 +66,19 @@ This automatically:
 **1. Prepare Data**
 
 ```bash
-prepare-data --dataset pbmc --mask-percentage 0.15 --seed 42
+prepare-data --dataset pbmc3k --mask-percentage 0.15 --seed 42
 ```
 
 **2. Run All Models**
 
 ```bash
-run-models --dataset pbmc
+run-models --dataset pbmc3k
 ```
 
 **3. Evaluate Results**
 
 ```bash
-run-evaluation --model scgpt --dataset pbmc
+run-evaluation --model scgpt --dataset pbmc3k
 ```
 
 ## Adding New Models

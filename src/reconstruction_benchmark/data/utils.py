@@ -29,7 +29,7 @@ def discover_raw_data_file(raw_dir: Path, dataset_name: str) -> Optional[Path]:
     raw_dir
         Directory containing raw data files
     dataset_name
-        Name of the dataset (e.g., "pbmc") - used for warning messages
+        Name of the dataset (e.g., "pbmc3k") - used for warning messages
 
     Returns
     -------

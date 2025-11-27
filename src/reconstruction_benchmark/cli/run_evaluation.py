@@ -26,7 +26,7 @@ def main():
         "--dataset",
         type=str,
         required=True,
-        help="Dataset name (e.g., pbmc)",
+        help="Dataset name (e.g., pbmc3k)",
     )
     parser.add_argument(
         "--results-dir",

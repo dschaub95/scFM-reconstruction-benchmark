@@ -23,8 +23,8 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="pbmc",
-        help="Dataset name (default: pbmc)",
+        default="pbmc3k",
+        help="Dataset name (default: pbmc3k)",
     )
     parser.add_argument(
         "--data-dir",
