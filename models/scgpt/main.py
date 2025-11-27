@@ -1,865 +1,21 @@
 """Main entry point for scGPT reconstruction benchmark."""
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
-# Add parent directory to path to import reconstruction_benchmark
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-
-import numpy as np
-import anndata as ad
 import torch
 
 from reconstruction_benchmark.config import ModelConfig
-
-try:
-    # Import scGPT - use the actual API structure
-    from scgpt.model.model import TransformerModel as scGPT
-    from scgpt.tokenizer.gene_tokenizer import GeneVocab
-    from scgpt.utils import load_pretrained
-
-    # scGPTConfig might not exist as a separate class - TransformerModel uses dict/config
-    # We'll handle config creation inline
-    scGPTConfig = None  # Will create config dict directly
-
-    SCGPT_AVAILABLE = True
-except ImportError as e:
-    SCGPT_AVAILABLE = False
-    print(f"Warning: scGPT imports failed: {e}")
-    print("Install with: pip install scgpt 'flash-attn<1.0.5' ipython")
-
-
-def get_checkpoints_dir() -> Path:
-    """
-    Get the checkpoints directory for scGPT models.
-
-    Returns
-    -------
-    Path to the checkpoints directory (models/scgpt/checkpoints/)
-    """
-    scgpt_dir = Path(__file__).parent
-    checkpoints_dir = scgpt_dir / "checkpoints"
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
-    return checkpoints_dir
-
-
-def get_local_checkpoint_path(model_name: str) -> Path:
-    """
-    Get the local checkpoint path for a given model name.
-
-    Parameters
-    ----------
-    model_name
-        Model name (e.g., "bwanglab/scGPT" or "scGPT-human")
-
-    Returns
-    -------
-    Path to the local checkpoint directory
-    """
-    checkpoints_dir = get_checkpoints_dir()
-    # Convert HuggingFace model ID to a safe directory name
-    checkpoint_name = model_name.replace("/", "_")
-    checkpoint_path = checkpoints_dir / checkpoint_name
-    return checkpoint_path
-
-
-def download_checkpoint_from_gdrive(
-    gdrive_folder_id: str,
-    output_dir: Path,
-    quiet: bool = False,
-) -> bool:
-    """
-    Download a checkpoint folder from Google Drive.
-
-    Parameters
-    ----------
-    gdrive_folder_id
-        Google Drive folder ID (from the shareable link)
-    output_dir
-        Directory where the checkpoint files will be saved
-    quiet
-        If True, suppress output messages
-
-    Returns
-    -------
-    True if download succeeded, False otherwise
-    """
-    try:
-        import gdown
-    except ImportError:
-        print("Error: gdown is not installed. Install with: pip install gdown")
-        return False
-
-    # Create output directory if it doesn't exist
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Construct Google Drive folder URL
-    folder_url = f"https://drive.google.com/drive/folders/{gdrive_folder_id}"
-
-    try:
-        if not quiet:
-            print(f"Downloading checkpoint from Google Drive: {folder_url}")
-            print(f"Saving to: {output_dir}")
-
-        # Download the entire folder
-        # gdown.download_folder downloads all files in the folder
-        gdown.download_folder(
-            folder_url,
-            output=str(output_dir),
-            quiet=quiet,
-            use_cookies=False,
-        )
-
-        # Verify that essential files were downloaded
-        required_files = ["best_model.pt"]
-        missing_files = [f for f in required_files if not (output_dir / f).exists()]
-
-        if missing_files:
-            print(f"Warning: Some required files are missing: {missing_files}")
-            # Check if files are in subdirectories (gdown sometimes creates subdirs)
-            for subdir in output_dir.iterdir():
-                if subdir.is_dir():
-                    for file in required_files:
-                        if (subdir / file).exists() and not (
-                            output_dir / file
-                        ).exists():
-                            # Move file to output_dir
-                            import shutil
-
-                            shutil.move(str(subdir / file), str(output_dir / file))
-                            if not quiet:
-                                print(f"Moved {file} from {subdir} to {output_dir}")
-
-        if not quiet:
-            print(f"✓ Successfully downloaded checkpoint to: {output_dir}")
-            sys.stdout.flush()
-        return True
-
-    except Exception as e:
-        print(f"Error downloading checkpoint from Google Drive: {e}")
-        return False
-
-
-def download_scgpt_checkpoint_from_gdrive(
-    checkpoint_name: str = "scGPT-human",
-    gdrive_folder_id: str = "1oWh_-ZRdhtoGQ2Fw24HP41FgLoomVo-y",
-    force_download: bool = False,
-) -> Path:
-    """
-    Download the scGPT checkpoint from Google Drive to local checkpoints directory.
-
-    This function downloads the official scGPT checkpoint from the Google Drive folder
-    containing best_model.pt, vocab.json, and args.json.
-
-    Parameters
-    ----------
-    checkpoint_name
-        Name for the checkpoint (used as directory name)
-    gdrive_folder_id
-        Google Drive folder ID (default: official scGPT checkpoint folder)
-    force_download
-        If True, re-download even if checkpoint already exists
-
-    Returns
-    -------
-    Path to the downloaded checkpoint directory
-    """
-    checkpoint_path = get_local_checkpoint_path(checkpoint_name)
-
-    # Check if checkpoint already exists
-    if checkpoint_path.exists() and (checkpoint_path / "best_model.pt").exists():
-        if not force_download:
-            print(f"✓ Checkpoint already exists at: {checkpoint_path}")
-            print("Skipping download. Use force_download=True to re-download.")
-            sys.stdout.flush()
-            return checkpoint_path
-        else:
-            print("Force download enabled. Re-downloading checkpoint...")
-
-    # Download from Google Drive
-    success = download_checkpoint_from_gdrive(
-        gdrive_folder_id=gdrive_folder_id,
-        output_dir=checkpoint_path,
-        quiet=False,
-    )
-
-    if success:
-        return checkpoint_path
-    else:
-        raise RuntimeError(
-            f"Failed to download checkpoint from Google Drive to {checkpoint_path}"
-        )
-
-
-def load_masked_data(config: ModelConfig) -> ad.AnnData:
-    """
-    Load masked data and identify masked positions.
-
-    Parameters
-    ----------
-    config
-        Model configuration
-
-    Returns
-    -------
-    AnnData object with masked data and mask information
-    """
-    masked_path = config.masked_data_path
-    if not masked_path.exists():
-        raise FileNotFoundError(f"Masked data not found: {masked_path}")
-
-    adata = ad.read_h5ad(masked_path)
-
-    # Convert sparse to dense if needed
-    X = adata.X
-    if hasattr(X, "toarray"):
-        X = X.toarray()
-    else:
-        X = X.copy()
-
-    # Store mask information (where values are -1)
-    mask_indices = X == -1
-
-    # Store original mask for later reconstruction
-    adata.uns["mask_indices"] = mask_indices
-
-    # For scGPT, we'll handle masking during inference
-    # Set masked values to 0 temporarily (scGPT will handle them)
-    X[mask_indices] = 0
-    adata.X = X
-
-    return adata
-
-
-def convert_checkpoint_weights(state_dict: dict) -> dict:
-    """
-    Convert checkpoint weights from fast_transformer format (Wqkv) to standard format (in_proj).
-
-    This function handles the case where the checkpoint was trained with flash attention
-    (using Wqkv combined QKV weights) but the model is running without flash-attn installed
-    (expecting separate in_proj_weight/in_proj_bias).
-
-    Parameters
-    ----------
-    state_dict
-        Original checkpoint state dict with Wqkv keys
-
-    Returns
-    -------
-    Converted state dict with in_proj keys
-    """
-    converted_dict = {}
-    keys_to_skip = set()  # Track keys we've converted
-
-    for key, value in state_dict.items():
-        # Skip flag_encoder.weight (not used in standard model)
-        if key == "flag_encoder.weight":
-            continue
-
-        # Convert Wqkv format to in_proj format
-        if ".self_attn.Wqkv.weight" in key:
-            # Replace Wqkv.weight with in_proj_weight
-            new_key = key.replace(".self_attn.Wqkv.weight", ".self_attn.in_proj_weight")
-            converted_dict[new_key] = value
-            keys_to_skip.add(key)
-        elif ".self_attn.Wqkv.bias" in key:
-            # Replace Wqkv.bias with in_proj_bias
-            new_key = key.replace(".self_attn.Wqkv.bias", ".self_attn.in_proj_bias")
-            converted_dict[new_key] = value
-            keys_to_skip.add(key)
-        elif key not in keys_to_skip:
-            # Keep all other keys as-is
-            converted_dict[key] = value
-
-    return converted_dict
-
-
-def prepare_data_for_scgpt(adata: ad.AnnData) -> tuple:
-    """
-    Prepare AnnData for scGPT model input.
-
-    Parameters
-    ----------
-    adata
-        AnnData object with expression data
-
-    Returns
-    -------
-    Tuple of (gene_names, expression_matrix, mask_indices)
-    """
-    # Get gene names
-    gene_names = adata.var_names.tolist()
-
-    # Get expression matrix
-    X = adata.X
-    if hasattr(X, "toarray"):
-        X = X.toarray()
-    X = np.array(X, dtype=np.float32)
-
-    # Get mask indices
-    mask_indices = adata.uns.get("mask_indices", np.zeros_like(X, dtype=bool))
-
-    return gene_names, X, mask_indices
-
-
-def run_scgpt_reconstruction(
-    adata: ad.AnnData,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    dev_mode: bool = False,
-) -> ad.AnnData:
-    """
-    Run scGPT reconstruction on masked data.
-
-    Parameters
-    ----------
-    adata
-        AnnData object with masked data
-    device
-        Device to run inference on
-
-    Returns
-    -------
-    AnnData object with reconstructed values
-    """
-    if not SCGPT_AVAILABLE:
-        raise ImportError(
-            "scGPT is not installed. Install with: pip install scgpt 'flash-attn<1.0.5'"
-        )
-
-    # Validate and potentially fix device
-    if device == "cuda":
-        # Test if CUDA actually works
-        try:
-            test_tensor = torch.zeros(1).to(device)
-            _ = test_tensor + 1  # Simple operation to test CUDA
-            del test_tensor
-            torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"Warning: CUDA device failed validation: {e}")
-            print("Falling back to CPU")
-            device = "cpu"
-
-    print(f"Using device: {device}")
-
-    # Prepare data
-    gene_names, X, mask_indices = prepare_data_for_scgpt(adata)
-    n_genes = len(gene_names)
-    n_cells = X.shape[0]
-
-    print(f"Data shape: {n_cells} cells × {n_genes} genes")
-    print(
-        f"Masked values: {mask_indices.sum()} ({100 * mask_indices.sum() / mask_indices.size:.2f}%)"
-    )
-
-    # Determine batch size based on dataset size and device
-    # Development mode: use batch size 2 and only process one batch
-    if dev_mode:
-        batch_size = 2
-        print("Development mode: using batch size 2, processing only one batch")
-    elif n_cells * n_genes > 50_000_000:
-        # Very large dataset - use very small batches
-        batch_size = min(10, n_cells)  # Process 10 cells at a time
-        print(
-            f"Very large dataset detected ({n_cells * n_genes:,} values). Processing in batches of {batch_size} cells."
-        )
-    elif n_cells * n_genes > 10_000_000:
-        # Large dataset - use small batches
-        batch_size = min(50, n_cells)  # Process 50 cells at a time
-        print(
-            f"Large dataset detected ({n_cells * n_genes:,} values). Processing in batches of {batch_size} cells."
-        )
-    elif n_cells * n_genes > 1_000_000:
-        # Moderately large dataset
-        batch_size = min(100, n_cells)  # Process 100 cells at a time
-        print(
-            f"Moderately large dataset ({n_cells * n_genes:,} values). Processing in batches of {batch_size} cells."
-        )
-    else:
-        batch_size = n_cells  # Process all at once for smaller datasets
-
-    # Track checkpoint file and directory for loading vocab and weights
-    # We need to detect checkpoint early to load vocab.json before creating model
-    checkpoint_file = None
-    checkpoint_dir = None
-
-    # Always look for checkpoints in the checkpoints folder
-    checkpoints_dir = get_checkpoints_dir()
-
-    # Search for any checkpoint in the checkpoints directory
-    if checkpoints_dir.exists():
-        # Look for any subdirectory containing best_model.pt
-        for checkpoint_subdir in checkpoints_dir.iterdir():
-            if checkpoint_subdir.is_dir():
-                potential_checkpoint = checkpoint_subdir / "best_model.pt"
-                if potential_checkpoint.exists():
-                    checkpoint_file = potential_checkpoint
-                    checkpoint_dir = checkpoint_subdir
-                    break
-
-    # If no checkpoint found, try auto-downloading from Google Drive
-    if checkpoint_file is None or not checkpoint_file.exists():
-        try:
-            print(
-                "No local checkpoint found. Automatically downloading from Google Drive..."
-            )
-            sys.stdout.flush()
-            gdrive_folder_id = "1oWh_-ZRdhtoGQ2Fw24HP41FgLoomVo-y"
-            checkpoint_name = "scGPT-human"
-
-            local_checkpoint_path = download_scgpt_checkpoint_from_gdrive(
-                checkpoint_name=checkpoint_name,
-                gdrive_folder_id=gdrive_folder_id,
-                force_download=False,
-            )
-
-            checkpoint_file = local_checkpoint_path / "best_model.pt"
-            checkpoint_dir = local_checkpoint_path
-
-            if checkpoint_file.exists():
-                print(f"✓ Successfully downloaded checkpoint to: {checkpoint_file}")
-                sys.stdout.flush()
-        except Exception as e:
-            print(f"✗ Failed to download checkpoint from Google Drive: {e}")
-            print("Will initialize new model (no pretrained weights)")
-            sys.stdout.flush()
-            checkpoint_file = None
-            checkpoint_dir = None
-
-    # Load vocabulary from checkpoint vocab.json if available, otherwise create from gene names
-    gene_vocab = None
-    vocab_size = None
-
-    if checkpoint_dir and (checkpoint_dir / "vocab.json").exists():
-        vocab_json_path = checkpoint_dir / "vocab.json"
-        try:
-            print(f"Loading vocabulary from checkpoint: {vocab_json_path}")
-            sys.stdout.flush()
-
-            # Load vocab.json - it's typically a list of tokens or a dict mapping tokens to indices
-            with open(vocab_json_path) as f:
-                vocab_data = json.load(f)
-
-            # Handle different vocab.json formats
-            if isinstance(vocab_data, list):
-                # If it's a list, use it directly
-                vocab_tokens = vocab_data
-            elif isinstance(vocab_data, dict):
-                # If it's a dict, extract the keys (tokens)
-                # Sort by index to maintain order (though GeneVocab may reorder)
-                vocab_tokens = sorted(vocab_data.keys(), key=lambda k: vocab_data[k])
-            else:
-                raise ValueError(f"Unexpected vocab.json format: {type(vocab_data)}")
-
-            # Create GeneVocab from checkpoint vocabulary
-            gene_vocab = GeneVocab(vocab_tokens)
-            if hasattr(gene_vocab, "set_default_index"):
-                # Use dictionary-style access instead of .get() method
-                if "<pad>" in gene_vocab:
-                    pad_idx = gene_vocab["<pad>"]
-                else:
-                    # Fallback: find pad token index from vocab_data dict if available
-                    if isinstance(vocab_data, dict) and "<pad>" in vocab_data:
-                        pad_idx = vocab_data["<pad>"]
-                    else:
-                        pad_idx = 0
-                gene_vocab.set_default_index(pad_idx)
-            vocab_size = len(gene_vocab)
-            print(f"✓ Loaded vocabulary with {vocab_size} tokens from checkpoint")
-            sys.stdout.flush()
-        except Exception as e:
-            # If checkpoint exists but vocab loading fails, this is a critical error
-            if checkpoint_file and checkpoint_file.exists():
-                raise RuntimeError(
-                    f"Failed to load checkpoint vocabulary from {vocab_json_path}. "
-                    f"This is required to load the checkpoint weights. Error: {e}"
-                )
-            else:
-                # No checkpoint file, so vocab loading failure is not critical
-                print(f"Warning: Could not load checkpoint vocabulary: {e}")
-                print("Creating vocabulary from data gene names...")
-                sys.stdout.flush()
-                gene_vocab = None
-
-    # Create vocabulary from gene names if checkpoint vocab not available
-    if gene_vocab is None:
-        try:
-            # GeneVocab needs special tokens - add them to gene list
-            special_tokens = [
-                "<pad>",
-                "<mask>",
-                "<cls>",
-                "<eoc>",
-            ]  # Common scGPT special tokens
-            all_tokens = special_tokens + gene_names
-            gene_vocab = GeneVocab(all_tokens)
-            # Set default index for unknown tokens
-            if hasattr(gene_vocab, "set_default_index"):
-                pad_idx = gene_vocab["<pad>"]
-                gene_vocab.set_default_index(pad_idx)
-            vocab_size = len(gene_vocab)
-            print(f"Created vocabulary with {vocab_size} tokens from data")
-            sys.stdout.flush()
-        except Exception as e:
-            print(f"Warning: Could not create gene vocabulary: {e}")
-            # Fallback: create vocab with special tokens manually
-            special_tokens = ["<pad>", "<mask>", "<cls>", "<eoc>"]
-            all_tokens = special_tokens + gene_names
-            gene_vocab = GeneVocab(all_tokens)
-            vocab_size = len(gene_vocab)
-
-    # Initialize model with appropriate parameters
-    # Using default parameters that work for reconstruction
-    model = None
-
-    try:
-        # Try to load pretrained checkpoint if found
-        if checkpoint_file and checkpoint_file.exists():
-            print(f"\n{'=' * 60}")
-            checkpoint_name = checkpoint_dir.name if checkpoint_dir else "checkpoint"
-            print(f"Loading scGPT checkpoint: {checkpoint_name}")
-            print(f"{'=' * 60}")
-            print(f"Checkpoint directory: {checkpoint_dir}")
-            print(f"✓ Found checkpoint at: {checkpoint_file}")
-            print("Will load checkpoint weights after model initialization...")
-            sys.stdout.flush()
-
-        # Initialize model with appropriate parameters for gene expression
-        # Try to load architecture from checkpoint args.json if available
-        model_config = {
-            "d_model": 512,  # Model dimension (embsize)
-            "nhead": 8,  # Number of attention heads
-            "d_hid": 2048,  # Feedforward dimension (default, will override from checkpoint)
-            "nlayers": 6,  # Number of transformer layers (default, will override from checkpoint)
-            "nlayers_cls": 3,  # Classification layers
-            "dropout": 0.1,  # Dropout (default, will override from checkpoint)
-            "pad_value": 0,  # Pad value (default, will override from checkpoint)
-            "do_mvc": False,  # Not using MVC decoder (default, will override from checkpoint)
-            "use_fast_transformer": False,  # Fast transformer (flash attention) - will override from checkpoint
-        }
-
-        # Load checkpoint args.json if available to get correct architecture
-        if checkpoint_file and checkpoint_file.exists():
-            args_json_path = checkpoint_file.parent / "args.json"
-            if args_json_path.exists():
-                try:
-                    with open(args_json_path) as f:
-                        checkpoint_args = json.load(f)
-                    print("Loading model architecture from checkpoint args.json...")
-                    sys.stdout.flush()
-
-                    # Override with checkpoint architecture parameters
-                    model_config["d_model"] = checkpoint_args.get(
-                        "embsize", model_config["d_model"]
-                    )
-                    model_config["nhead"] = checkpoint_args.get(
-                        "nheads", model_config["nhead"]
-                    )
-                    model_config["d_hid"] = checkpoint_args.get(
-                        "d_hid", model_config["d_hid"]
-                    )
-                    model_config["nlayers"] = checkpoint_args.get(
-                        "nlayers", model_config["nlayers"]
-                    )
-                    model_config["nlayers_cls"] = checkpoint_args.get(
-                        "n_layers_cls", model_config["nlayers_cls"]
-                    )
-                    model_config["dropout"] = checkpoint_args.get(
-                        "dropout", model_config["dropout"]
-                    )
-                    model_config["pad_value"] = checkpoint_args.get(
-                        "pad_value", model_config["pad_value"]
-                    )
-                    model_config["do_mvc"] = checkpoint_args.get(
-                        "MVC", model_config["do_mvc"]
-                    )
-                    # fast_transformer in checkpoint args.json maps to use_fast_transformer parameter
-                    model_config["use_fast_transformer"] = checkpoint_args.get(
-                        "fast_transformer", model_config["use_fast_transformer"]
-                    )
-
-                    print(
-                        f"  Architecture: d_model={model_config['d_model']}, d_hid={model_config['d_hid']}, "
-                        f"nlayers={model_config['nlayers']}, nhead={model_config['nhead']}, "
-                        f"use_fast_transformer={model_config['use_fast_transformer']}"
-                    )
-                    sys.stdout.flush()
-                except Exception as e:
-                    print(f"Warning: Could not load args.json: {e}")
-                    print("Using default architecture parameters...")
-                    sys.stdout.flush()
-
-        if model is None:
-            print("Initializing scGPT model architecture...")
-            sys.stdout.flush()
-
-            # Ensure vocab_size is set - use checkpoint vocab if available, otherwise data vocab
-            if vocab_size is None:
-                raise RuntimeError(
-                    "Vocabulary size not determined. Cannot initialize model."
-                )
-
-            print(f"  Using vocabulary size: {vocab_size} tokens")
-            sys.stdout.flush()
-
-            model = scGPT(
-                ntoken=vocab_size,  # Use vocab size from checkpoint or data
-                d_model=model_config["d_model"],
-                nhead=model_config["nhead"],
-                d_hid=model_config["d_hid"],
-                nlayers=model_config["nlayers"],
-                nlayers_cls=model_config["nlayers_cls"],
-                vocab=gene_vocab,
-                dropout=model_config["dropout"],
-                pad_token="<pad>",
-                pad_value=model_config["pad_value"],
-                do_mvc=model_config["do_mvc"],
-                input_emb_style="continuous",  # Continuous value encoding
-                cell_emb_style="cls",  # CLS token for cell embedding
-                use_fast_transformer=model_config[
-                    "use_fast_transformer"
-                ],  # Match checkpoint architecture
-            )
-
-            # Try to load checkpoint weights if available
-            if checkpoint_file and checkpoint_file.exists():
-                try:
-                    print(f"Loading pretrained weights from: {checkpoint_file}")
-                    sys.stdout.flush()
-                    checkpoint = torch.load(checkpoint_file, map_location="cpu")
-
-                    # Extract state dict from checkpoint
-                    if isinstance(checkpoint, dict):
-                        if "model_state_dict" in checkpoint:
-                            state_dict = checkpoint["model_state_dict"]
-                        elif "state_dict" in checkpoint:
-                            state_dict = checkpoint["state_dict"]
-                        else:
-                            state_dict = checkpoint
-                    else:
-                        state_dict = checkpoint
-
-                    # Convert weights if checkpoint uses Wqkv format (flash attention) but model expects in_proj format
-                    # This is only needed when checkpoint was trained with flash-attn but model runs without it
-                    # If model architecture matches checkpoint (both use flash attention), no conversion needed
-                    has_wqkv = any(
-                        ".self_attn.Wqkv." in key for key in state_dict.keys()
-                    )
-                    model_expects_in_proj = not model_config["use_fast_transformer"]
-
-                    if has_wqkv and model_expects_in_proj:
-                        print(
-                            "  Converting checkpoint weights from Wqkv format to in_proj format..."
-                        )
-                        print(
-                            "  (Checkpoint uses flash attention format, but model runs without it - converting)"
-                        )
-                        sys.stdout.flush()
-                        state_dict = convert_checkpoint_weights(state_dict)
-                    elif has_wqkv and not model_expects_in_proj:
-                        print(
-                            "  Checkpoint uses flash attention format, model architecture matches - no conversion needed"
-                        )
-                        sys.stdout.flush()
-
-                    # Use scGPT's internal load_pretrained function for better weight loading
-                    # This handles mismatches more gracefully than manual load_state_dict
-                    print("  Loading weights using scGPT's load_pretrained function...")
-                    sys.stdout.flush()
-                    model = load_pretrained(
-                        model=model,
-                        pretrained_params=state_dict,
-                        strict=False,  # Allow partial loading for architecture differences
-                        verbose=True,  # Print loading information
-                    )
-                    print("✓ Successfully loaded pretrained weights from checkpoint")
-                    print(f"  Checkpoint: {checkpoint_file}")
-                    sys.stdout.flush()
-                except Exception as e:
-                    print(f"✗ Could not load checkpoint weights: {e}")
-                    print("Continuing with randomly initialized weights...")
-                    sys.stdout.flush()
-            else:
-                print("✓ Initialized new scGPT model (no pretrained checkpoint)")
-                sys.stdout.flush()
-    except Exception as e:
-        print(f"Error initializing model: {e}")
-        raise RuntimeError(f"Failed to initialize scGPT model: {e}")
-
-    if model is None:
-        raise RuntimeError("Failed to initialize scGPT model")
-
-    model = model.to(device)
-    model.eval()
-
-    # Prepare input
-    # Convert expression to tensor (keep on CPU initially, move to device per batch)
-    X_tensor = torch.tensor(X, dtype=torch.float32)
-
-    # Run inference in batches
-    print(f"Running scGPT inference in batches of {batch_size} cells...")
-    all_predictions = []
-
-    # In dev mode, limit to one batch
-    max_cells_to_process = batch_size if dev_mode else n_cells
-
-    with torch.no_grad():
-        # Create gene indices template (same for all batches)
-        gene_indices_template = torch.arange(n_genes, dtype=torch.long)
-
-        for batch_start in range(0, max_cells_to_process, batch_size):
-            batch_end = min(batch_start + batch_size, n_cells)
-            batch_cells = batch_end - batch_start
-
-            print(
-                f"Processing batch {batch_start // batch_size + 1}/{(n_cells + batch_size - 1) // batch_size} "
-                f"(cells {batch_start}-{batch_end - 1})..."
-            )
-
-            # Prepare batch tensors
-            batch_gene_indices = (
-                gene_indices_template.unsqueeze(0).repeat(batch_cells, 1).to(device)
-            )
-            batch_values = X_tensor[batch_start:batch_end].to(device)
-            batch_mask = torch.tensor(
-                mask_indices[batch_start:batch_end], dtype=torch.bool
-            ).to(device)
-
-            try:
-                # Forward pass
-                outputs = model(
-                    batch_gene_indices,
-                    values=batch_values,
-                    src_key_padding_mask=batch_mask,
-                )
-
-                # Extract predictions
-                if isinstance(outputs, torch.Tensor):
-                    batch_predictions = outputs
-                elif isinstance(outputs, (tuple, list)):
-                    batch_predictions = outputs[0]
-                elif isinstance(outputs, dict):
-                    batch_predictions = outputs.get(
-                        "prediction",
-                        outputs.get("reconstruction", list(outputs.values())[0]),
-                    )
-                else:
-                    print(
-                        f"Warning: Unexpected output format: {type(outputs)}, using input values"
-                    )
-                    batch_predictions = batch_values
-
-                # Move to CPU and convert to numpy
-                if batch_predictions.is_cuda:
-                    batch_predictions = batch_predictions.cpu()
-                batch_predictions = batch_predictions.numpy()
-                all_predictions.append(batch_predictions)
-
-                # Clear GPU cache if using CUDA
-                if device == "cuda":
-                    torch.cuda.empty_cache()
-
-            except RuntimeError as e:
-                error_msg = str(e)
-                # Check if it's a memory or CUDA error
-                if (
-                    "cuda" in error_msg.lower()
-                    or "CUDA" in error_msg
-                    or "memory" in error_msg.lower()
-                ):
-                    print(f"Memory/CUDA error in batch: {e}")
-                    if device == "cuda":
-                        print("Retrying batch on CPU...")
-                        # Retry on CPU
-                        device = "cpu"
-                        model = model.cpu()
-                        batch_gene_indices = batch_gene_indices.cpu()
-                        batch_values = batch_values.cpu()
-                        batch_mask = batch_mask.cpu()
-
-                        try:
-                            outputs = model(
-                                batch_gene_indices,
-                                values=batch_values,
-                                src_key_padding_mask=batch_mask,
-                            )
-                            if isinstance(outputs, torch.Tensor):
-                                batch_predictions = outputs
-                            elif isinstance(outputs, (tuple, list)):
-                                batch_predictions = outputs[0]
-                            elif isinstance(outputs, dict):
-                                batch_predictions = outputs.get(
-                                    "prediction", list(outputs.values())[0]
-                                )
-                            else:
-                                batch_predictions = batch_values
-
-                            batch_predictions = batch_predictions.cpu().numpy()
-                            all_predictions.append(batch_predictions)
-                            print("Batch completed on CPU")
-                        except Exception as e2:
-                            print(f"CPU inference also failed: {e2}")
-                            print("Using input values for this batch")
-                            all_predictions.append(X[batch_start:batch_end])
-                    else:
-                        print("Using input values for this batch")
-                        all_predictions.append(X[batch_start:batch_end])
-                else:
-                    print(f"Error in batch: {e}")
-                    print("Using input values for this batch")
-                    all_predictions.append(X[batch_start:batch_end])
-            except Exception as e:
-                print(f"Error in batch: {e}")
-                print("Using input values for this batch")
-                all_predictions.append(X[batch_start:batch_end])
-
-        # Concatenate all batch predictions
-        if all_predictions:
-            predictions = np.concatenate(all_predictions, axis=0)
-        else:
-            print("Warning: No predictions generated, using input values")
-            predictions = X
-
-    # Create reconstruction: replace masked values with predictions
-    reconstruction = adata.copy()
-    X_recon = X.copy()
-
-    # In dev mode, we only processed a subset of cells
-    if dev_mode and predictions.shape[0] < X.shape[0]:
-        print(
-            f"Dev mode: Only processed {predictions.shape[0]} cells out of {X.shape[0]}"
-        )
-        # Only replace predictions for the cells we processed
-        processed_mask = np.zeros(X.shape[0], dtype=bool)
-        processed_mask[: predictions.shape[0]] = True
-        # Combine processed predictions with original values for unprocessed cells
-        X_recon[: predictions.shape[0]] = predictions
-        # For processed cells, replace masked values with predictions
-        processed_mask_2d = processed_mask[:, np.newaxis] & mask_indices
-        X_recon[processed_mask_2d] = predictions[mask_indices[: predictions.shape[0]]]
-    elif predictions.shape == X.shape:
-        # Normal mode: replace all masked values with predictions
-        X_recon[mask_indices] = predictions[mask_indices]
-    else:
-        # If predictions have different shape, try to reshape
-        print(f"Warning: Prediction shape {predictions.shape} != input shape {X.shape}")
-        # Use mean prediction or handle appropriately
-        if predictions.ndim == 2 and predictions.shape[0] == X.shape[0]:
-            # Take first n_genes columns if predictions are wider
-            predictions = predictions[:, : X.shape[1]]
-            X_recon[mask_indices] = predictions[mask_indices]
-        else:
-            print("Warning: Could not match prediction shape, using original values")
-
-    reconstruction.X = X_recon
-
-    # Remove temporary mask information
-    if "mask_indices" in reconstruction.uns:
-        del reconstruction.uns["mask_indices"]
-
-    print("Reconstruction complete")
-    return reconstruction
+from reconstruction_benchmark.utils import get_project_root
+
+# Import functions from other scripts
+from download_ckpt import ensure_checkpoint
+from inference import load_masked_data, run_inference, save_reconstruction
+from setup import setup_model
+
+# Define execution stages in order
+STAGES = ["install", "download", "load_data", "setup", "inference", "save"]
 
 
 def main():
@@ -912,16 +68,54 @@ def main():
         action="store_true",
         help="Development mode: run only one batch with batch size 2 for quick testing.",
     )
+    parser.add_argument(
+        "--skip-install",
+        action="store_true",
+        help="Skip environment installation step",
+    )
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Skip checkpoint download step",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help="Path to checkpoint directory (if not using auto-download)",
+    )
+    parser.add_argument(
+        "--stage",
+        type=str,
+        choices=STAGES,
+        default=None,
+        help=f"Stop after completing this stage. Available stages: {', '.join(STAGES)}",
+    )
 
     args = parser.parse_args()
+
+    # Resolve data_dir and results_dir relative to project root if they are relative paths
+    project_root = get_project_root(Path(__file__).parent)
+
+    # If data_dir is relative, resolve it relative to project root
+    if not args.data_dir.is_absolute():
+        data_dir = (project_root / args.data_dir).resolve()
+    else:
+        data_dir = args.data_dir
+
+    # If results_dir is relative, resolve it relative to project root
+    if not args.results_dir.is_absolute():
+        results_dir = (project_root / args.results_dir).resolve()
+    else:
+        results_dir = args.results_dir
 
     config = ModelConfig(
         model_name="scgpt",
         dataset_name=args.dataset,
         mask_percentage=args.mask_percentage,
         seed=args.seed,
-        data_dir=args.data_dir,
-        results_dir=args.results_dir,
+        data_dir=data_dir,
+        results_dir=results_dir,
     )
 
     # Create output directory
@@ -933,35 +127,73 @@ def main():
     else:
         device = args.device
 
-    # Load masked data
+    # Step 1: Install environment (if needed)
+    if not args.skip_install:
+        from install import install_environment
+
+        print("Checking/installing environment...")
+        install_environment()
+
+    if args.stage == "install":
+        print(f"Stopping after stage: {args.stage}")
+        return
+
+    # Step 2: Ensure checkpoint is available
+    checkpoint_path = ensure_checkpoint(
+        checkpoint_path=args.checkpoint_path,
+        skip_download=args.skip_download,
+        checkpoint_name="scGPT-human",
+        gdrive_folder_id="1oWh_-ZRdhtoGQ2Fw24HP41FgLoomVo-y",
+    )
+
+    if args.stage == "download":
+        print(f"Stopping after stage: {args.stage}")
+        return
+
+    # Step 3: Load masked data
     print(f"Loading masked data from {config.masked_data_path}...")
     masked_data = load_masked_data(config)
 
-    # Run reconstruction
+    if args.stage == "load_data":
+        print(f"Stopping after stage: {args.stage}")
+        return
+
+    # Step 4: Setup model (load checkpoint and initialize)
+    print("Setting up scGPT model...")
+    gene_names = masked_data.var_names.tolist()
+    model, vocab = setup_model(
+        checkpoint_path=checkpoint_path,
+        device=device,
+        gene_names=gene_names,
+    )
+
+    if args.stage == "setup":
+        print(f"Stopping after stage: {args.stage}")
+        return
+
+    # Step 5: Run inference
     print("Running scGPT reconstruction...")
-    reconstruction = run_scgpt_reconstruction(
-        masked_data,
+    reconstruction = run_inference(
+        model=model,
+        vocab=vocab,
+        adata=masked_data,
         device=device,
         dev_mode=args.dev,
     )
 
-    # Save reconstruction
-    output_path = config.output_dir / "reconstruction.h5ad"
-    reconstruction.write(output_path)
-    print(f"Saved reconstruction to {output_path}")
+    if args.stage == "inference":
+        print(f"Stopping after stage: {args.stage}")
+        return
 
-    # Save metadata
-    metadata = {
-        "model": "scgpt",
-        "dataset": args.dataset,
-        "n_cells": reconstruction.n_obs,
-        "n_genes": reconstruction.n_vars,
-    }
+    # Step 6: Save reconstruction
+    save_reconstruction(
+        reconstruction=reconstruction,
+        config=config,
+    )
 
-    metadata_path = config.output_dir / "metadata.json"
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-    print(f"Saved metadata to {metadata_path}")
+    if args.stage == "save":
+        print(f"Stopping after stage: {args.stage}")
+        return
 
 
 if __name__ == "__main__":

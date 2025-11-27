@@ -6,6 +6,49 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from reconstruction_benchmark.utils import get_project_root
+
+
+def resolve_file_path(model_dir: Path, file_name: str) -> Optional[Path]:
+    """
+    Resolve file path in model directory, auto-appending .py if needed.
+
+    Parameters
+    ----------
+    model_dir
+        Path to the model directory
+    file_name
+        File name (with or without .py extension)
+
+    Returns
+    -------
+    Path to the file if it exists, None otherwise
+    """
+    if not file_name.endswith(".py"):
+        file_name = file_name + ".py"
+
+    file_path = model_dir / file_name
+    if file_path.exists():
+        return file_path
+    return None
+
+
+def detect_venv_mode(model_dir: Path) -> str:
+    """
+    Detect whether to use uv or conda mode based on pyproject.toml presence.
+
+    Parameters
+    ----------
+    model_dir
+        Directory containing the model (where pyproject.toml would be)
+
+    Returns
+    -------
+    "uv" if pyproject.toml exists, "conda" otherwise
+    """
+    pyproject_path = model_dir / "pyproject.toml"
+    return "uv" if pyproject_path.exists() else "conda"
+
 
 def discover_models(models_dir: Path) -> List[str]:
     """
@@ -39,158 +82,16 @@ def discover_models(models_dir: Path) -> List[str]:
     return sorted(models)
 
 
-def get_model_script_name(model_dir: Path) -> Optional[str]:
-    """
-    Extract the script name from a model's pyproject.toml.
-
-    Parameters
-    ----------
-    model_dir
-        Path to the model directory
-
-    Returns
-    -------
-    Script name if found, None otherwise
-    """
-    pyproject_path = model_dir / "pyproject.toml"
-    if not pyproject_path.exists():
-        return None
-
-    try:
-        import tomli
-    except ImportError:
-        # Fallback to basic parsing if tomli is not available
-        with open(pyproject_path) as f:
-            in_scripts_section = False
-            for line in f:
-                line = line.strip()
-                if line.startswith("[project.scripts]"):
-                    in_scripts_section = True
-                    continue
-                if line.startswith("[") and in_scripts_section:
-                    break
-                if in_scripts_section and "=" in line:
-                    # Extract script name (everything before =)
-                    script_name = line.split("=")[0].strip()
-                    if script_name:
-                        return script_name
-        return None
-
-    with open(pyproject_path, "rb") as f:
-        config = tomli.load(f)
-
-    scripts = config.get("project", {}).get("scripts", {})
-    if scripts:
-        # Return the first script name
-        return list(scripts.keys())[0]
-
-    return None
-
-
-def get_project_root() -> Path:
-    """
-    Get the project root directory.
-
-    When running from the installed package, the project root is 3 levels up
-    from this file: cli -> reconstruction_benchmark -> src -> project_root
-
-    Returns
-    -------
-    Path to the project root directory
-    """
-    # This file is at: src/reconstruction_benchmark/cli/run_models.py
-    # Project root is: ../../../
-    script_path = Path(__file__).resolve()
-    project_root = script_path.parent.parent.parent.parent
-    return project_root
-
-
-def check_uv_available() -> bool:
-    """
-    Check if uv command is available.
-
-    Returns
-    -------
-    True if uv is available, False otherwise
-    """
-    try:
-        subprocess.run(
-            ["uv", "--version"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
-
-
-def install_parent_package(project_root: Path, use_uv: bool = False) -> bool:
-    """
-    Install the parent reconstruction-benchmark package in editable mode.
-
-    Parameters
-    ----------
-    project_root
-        Path to the project root directory
-    use_uv
-        Whether to use uv instead of pip
-
-    Returns
-    -------
-    True if installation succeeded, False otherwise
-    """
-    print(f"Installing parent package from {project_root}...")
-
-    if use_uv:
-        # Use uv pip install
-        install_cmd = [
-            "uv",
-            "pip",
-            "install",
-            "-e",
-            str(project_root),
-        ]
-    else:
-        # Use standard pip
-        install_cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-e",
-            str(project_root),
-        ]
-
-    try:
-        subprocess.run(
-            install_cmd,
-            cwd=project_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        print("Parent package installed successfully.")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Error installing parent package: {e.stderr}", file=sys.stderr)
-        return False
-
-
 def run_model(
     model_name: str,
     model_dir: Path,
-    project_root: Path,
-    dataset: str = "pbmc",
-    data_dir: Path = Path("data"),
-    results_dir: Path = Path("results"),
-    mask_percentage: float = 0.15,
-    seed: int = 42,
-    use_uv: bool = False,
-    dev_mode: bool = False,
+    file_name: Optional[str] = None,
+    extra_args: Optional[List[str]] = None,
 ) -> bool:
     """
-    Install and run a single model.
+    Run a single model script.
+
+    Automatically detects venv mode (uv vs conda) and ensures venv exists before running.
 
     Parameters
     ----------
@@ -198,20 +99,10 @@ def run_model(
         Name of the model (directory name)
     model_dir
         Path to the model directory
-    project_root
-        Path to the project root directory
-    dataset
-        Dataset name to use
-    data_dir
-        Data directory path
-    results_dir
-        Results directory path
-    mask_percentage
-        Mask percentage used for masked data
-    use_uv
-        Whether to use uv instead of pip
-    dev_mode
-        Whether to run in development mode (pass --dev flag to model)
+    file_name
+        Specific file to run (e.g., 'install.py'). If None, runs main.py
+    extra_args
+        Additional arguments to pass to the file being run
 
     Returns
     -------
@@ -219,121 +110,82 @@ def run_model(
     """
     print(f"\n{'=' * 60}")
     print(f"Running model: {model_name}")
+    if file_name:
+        print(f"Running file: {file_name}")
     print(f"{'=' * 60}")
 
-    # Get script name from pyproject.toml
-    script_name = get_model_script_name(model_dir)
-
-    if use_uv:
-        # Use uv run --directory to run the model
-        # First sync dependencies, then install parent package
-        print(f"Preparing environment for {model_name}...")
-
-        # First, sync dependencies from pyproject.toml
-        # This will create the venv and install all dependencies including the model package
-        # reconstruction-benchmark is not in pyproject.toml, so uv sync will only install
-        # the other dependencies, which is what we want
-        try:
-            subprocess.run(
-                ["uv", "sync", "--directory", str(model_dir)],
-                cwd=model_dir,
-                check=True,
-                capture_output=True,
-                text=True,
+    # Resolve file path
+    if file_name:
+        target_file = resolve_file_path(model_dir, file_name)
+        if target_file is None:
+            print(
+                f"Error: File '{file_name}' not found in {model_dir}", file=sys.stderr
             )
-        except subprocess.CalledProcessError as e:
-            print(f"Error syncing model dependencies: {e.stderr}", file=sys.stderr)
+            return False
+    else:
+        target_file = model_dir / "main.py"
+        if not target_file.exists():
+            print(f"Error: main.py not found in {model_dir}", file=sys.stderr)
             return False
 
-        # Get the venv Python path (should exist after uv sync)
+    # Detect venv mode
+    venv_mode = detect_venv_mode(model_dir)
+
+    if venv_mode == "uv":
+        # UV mode: use uv run --directory
+        # Check if venv needs to be created
         venv_python = model_dir / ".venv" / "bin" / "python"
         if not venv_python.exists():
-            print(f"Error: venv not found after sync for {model_name}", file=sys.stderr)
-            return False
+            # Run install.py to create venv
+            install_script = model_dir / "install.py"
+            if not install_script.exists():
+                print(
+                    f"Error: install.py not found at {install_script}",
+                    file=sys.stderr,
+                )
+                return False
 
-        # Install the parent package in the model's venv
-        # This makes reconstruction-benchmark available to the model
-        try:
-            subprocess.run(
-                [
-                    "uv",
-                    "pip",
-                    "install",
-                    "--python",
-                    str(venv_python),
-                    "-e",
-                    str(project_root),
-                ],
+            print("Venv not found. Running install.py to create venv...")
+            result = subprocess.run(
+                [sys.executable, str(install_script)],
                 cwd=model_dir,
-                check=True,
-                capture_output=True,
-                text=True,
+                check=False,
             )
-        except subprocess.CalledProcessError as e:
-            print(f"Error installing parent package: {e.stderr}", file=sys.stderr)
-            return False
+            if result.returncode != 0:
+                print("Error: Failed to create venv via install.py", file=sys.stderr)
+                return False
 
-        # Run the model script using the venv's Python directly
-        # This avoids needing to install the model as a package
-        print(f"Running {model_name}...")
-        # Always run main.py directly since we're not installing the model package
-        # Use -u flag for unbuffered output to ensure checkpoint loading messages are visible
-        run_cmd = [str(venv_python), "-u", str(model_dir / "main.py")]
-    else:
-        # Use pip to install and run
-        print(f"Installing {model_name}...")
-        # Install model with parent package explicitly to ensure local version is used
-        install_cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-e",
+            # Verify venv was created
+            venv_python = model_dir / ".venv" / "bin" / "python"
+            if not venv_python.exists():
+                print("Error: venv not found after running install.py", file=sys.stderr)
+                return False
+
+        # Build command using uv run --directory
+        run_cmd = [
+            "uv",
+            "run",
+            "--directory",
             str(model_dir),
-            "-e",
-            str(project_root),
+            "python",
+            "-u",
+            str(target_file),
         ]
 
-        try:
-            subprocess.run(
-                install_cmd,
-                cwd=project_root,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"Error installing {model_name}: {e.stderr}", file=sys.stderr)
-            return False
+        # Add any extra arguments (flags) passed through
+        if extra_args:
+            run_cmd.extend(extra_args)
 
-        # Run the model script
-        if script_name:
-            run_cmd = [script_name]
-        else:
-            # Fallback to running main.py directly
-            # Use -u flag for unbuffered output to ensure checkpoint loading messages are visible
-            run_cmd = [sys.executable, "-u", str(model_dir / "main.py")]
+    else:
+        # Conda mode: use current behavior (not implemented yet)
+        print(
+            "Error: Conda mode is not yet implemented. "
+            "Please use a model with pyproject.toml for uv mode.",
+            file=sys.stderr,
+        )
+        return False
 
-    # Add common arguments
-    run_cmd.extend(
-        [
-            "--dataset",
-            dataset,
-            "--data-dir",
-            str(data_dir),
-            "--results-dir",
-            str(results_dir),
-            "--mask-percentage",
-            str(mask_percentage),
-            "--seed",
-            str(seed),
-        ]
-    )
-
-    # Add dev flag if dev_mode is enabled
-    if dev_mode:
-        run_cmd.append("--dev")
-
+    # Execute model using subprocess
     print(f"Running: {' '.join(run_cmd)}")
     try:
         subprocess.run(
@@ -351,37 +203,8 @@ def run_model(
 def main():
     """Main entry point for run-models script."""
     parser = argparse.ArgumentParser(
-        description="Run all models for reconstruction benchmark"
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="pbmc",
-        help="Dataset name (default: pbmc)",
-    )
-    parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=None,
-        help="Directory containing data (default: data relative to project root)",
-    )
-    parser.add_argument(
-        "--results-dir",
-        type=Path,
-        default=None,
-        help="Directory to save results (default: results relative to project root)",
-    )
-    parser.add_argument(
-        "--mask-percentage",
-        type=float,
-        default=0.15,
-        help="Mask percentage used for masked data (default: 0.15)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed used for masking (default: 42)",
+        description="Run all models for reconstruction benchmark",
+        allow_abbrev=False,  # Prevent abbreviation conflicts with model arguments
     )
     parser.add_argument(
         "--models-dir",
@@ -397,30 +220,29 @@ def main():
         help="Specific models to run (default: all discovered models)",
     )
     parser.add_argument(
-        "--use-uv",
-        action="store_true",
-        help="Use uv instead of pip for running models",
+        "-m",
+        "--model",
+        type=str,
+        default=None,
+        help="Specific model to run (default: all discovered models)",
     )
     parser.add_argument(
-        "--skip-parent-install",
-        action="store_true",
-        help="Skip installing parent package (assumes already installed)",
-    )
-    parser.add_argument(
-        "--dev",
-        action="store_true",
-        help="Development mode: pass --dev flag to all model scripts for quick testing",
+        "-f",
+        "--file",
+        type=str,
+        default=None,
+        help="Specific file to run (e.g., 'install', 'install.py', 'download_ckpt.py'). Defaults to main.py. All other arguments will be passed to the model's main.py.",
     )
 
-    args = parser.parse_args()
+    # Use parse_known_args to allow pass-through of arguments to the file being run
+    # This allows extra arguments to be passed to main.py when a single model is specified
+    args, unknown_args = parser.parse_known_args()
 
     # Get project root
     project_root = get_project_root()
 
     # Set default paths relative to project root
     models_dir = (project_root / (args.models_dir or Path("models"))).resolve()
-    data_dir = (project_root / (args.data_dir or Path("data"))).resolve()
-    results_dir = (project_root / (args.results_dir or Path("results"))).resolve()
 
     # Discover models
     all_models = discover_models(models_dir)
@@ -429,8 +251,14 @@ def main():
         print(f"No models found in {models_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Filter to requested models if specified
-    if args.models:
+    # Handle model filtering: --model takes precedence over --models
+    if args.model:
+        if args.model not in all_models:
+            print(f"Model '{args.model}' not found", file=sys.stderr)
+            print(f"Available models: {all_models}", file=sys.stderr)
+            sys.exit(1)
+        models_to_run = [args.model]
+    elif args.models:
         models_to_run = [m for m in args.models if m in all_models]
         if not models_to_run:
             print(f"None of the specified models found: {args.models}", file=sys.stderr)
@@ -442,36 +270,41 @@ def main():
     else:
         models_to_run = all_models
 
+    # Validate that pass-through arguments are only used with a single model
+    if unknown_args and len(models_to_run) > 1:
+        print(
+            "Error: Cannot pass arguments to file when running multiple models.",
+            file=sys.stderr,
+        )
+        print(
+            "Please specify a single model with -m/--model to pass additional arguments.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # If unknown arguments are provided but no single model is specified, treat as error
+    if unknown_args and len(models_to_run) != 1:
+        parser.error(f"unrecognized arguments: {' '.join(unknown_args)}")
+
     print(f"Found {len(all_models)} model(s): {', '.join(all_models)}")
     print(f"Will run {len(models_to_run)} model(s): {', '.join(models_to_run)}")
-
-    # Auto-detect uv if not explicitly set
-    if not args.use_uv:
-        args.use_uv = check_uv_available()
-        if args.use_uv:
-            print("Detected uv, using it for package management")
-
-    # Install parent package if needed
-    if not args.skip_parent_install:
-        if not install_parent_package(project_root, use_uv=args.use_uv):
-            print("Failed to install parent package. Exiting.", file=sys.stderr)
-            sys.exit(1)
+    if args.file:
+        print(f"Will run file: {args.file}")
+    if unknown_args and len(models_to_run) == 1:
+        file_name = args.file or "main.py"
+        print(f"Passing arguments to {file_name}: {' '.join(unknown_args)}")
 
     # Run each model
     results = {}
     for model_name in models_to_run:
         model_dir = models_dir / model_name
+        # Pass all unknown args to model's main.py (only if single model)
+        extra_args_to_pass = unknown_args if len(models_to_run) == 1 else None
         success = run_model(
             model_name=model_name,
             model_dir=model_dir,
-            project_root=project_root,
-            dataset=args.dataset,
-            data_dir=data_dir,
-            results_dir=results_dir,
-            mask_percentage=args.mask_percentage,
-            seed=args.seed,
-            use_uv=args.use_uv,
-            dev_mode=args.dev,
+            file_name=args.file,
+            extra_args=extra_args_to_pass,
         )
         results[model_name] = success
 

@@ -6,21 +6,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-
-def get_project_root() -> Path:
-    """
-    Get the project root directory.
-
-    When running from the installed package, the project root is 3 levels up
-    from this file: cli -> reconstruction_benchmark -> src -> project_root
-
-    Returns
-    -------
-    Path to the project root directory
-    """
-    script_path = Path(__file__).resolve()
-    project_root = script_path.parent.parent.parent.parent
-    return project_root
+from reconstruction_benchmark.utils import get_project_root
 
 
 def discover_models(models_dir: Path) -> List[str]:

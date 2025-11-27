@@ -27,5 +27,5 @@ scgpt-run = "main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-include = ["main.py"]
+include = ["main.py", "install.py", "download_ckpt.py", "setup.py", "inference.py"]
 
